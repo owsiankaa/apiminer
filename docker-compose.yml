@@ -1,0 +1,54 @@
+services:
+  target_app:
+    image: bkimminich/juice-shop:latest
+    platform: linux/amd64
+    container_name: target_app
+    ports:
+      - "8080:3000"
+    networks:
+      - synth_net
+
+  ebpf_sniffer:
+    build: ./ebpf_sniffer
+    container_name: ebpf_sniffer
+    privileged: true
+    network_mode: "service:target_app"
+    pid: "host"
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/fs/bpf:/sys/fs/bpf
+      - ./shared_data:/data
+    depends_on:
+      - target_app
+
+  explorer:
+    build: ./explorer
+    container_name: explorer
+    environment:
+      - TARGET_URL=http://target_app:3000
+      - MAX_PAGES=10
+    volumes:
+      - ./shared_data:/data
+    networks:
+      - synth_net
+    depends_on:
+      - target_app
+      - ebpf_sniffer
+
+  synthesizer:
+    build: ./synthesizer
+    container_name: synthesizer
+    environment:
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - MODEL_NAME=qwen2.5-coder:14b
+    volumes:
+      - ./shared_data:/data
+    networks:
+      - synth_net
+    depends_on:
+      explorer:
+        condition: service_completed_successfully
+
+networks:
+  synth_net:
+    driver: bridge
