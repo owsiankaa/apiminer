@@ -9,38 +9,75 @@ services:
       - synth_net
 
   ebpf_sniffer:
-    build: ./ebpf_sniffer
+    build:
+      context: .
+      dockerfile: ebpf_sniffer/Dockerfile
     container_name: ebpf_sniffer
-    privileged: true
+    privileged: true            # Docker Desktop / WSL2; na Linuksie można zawęzić do cap_add: [NET_ADMIN, SYS_ADMIN, BPF, PERFMON]
     network_mode: "service:target_app"
     pid: "host"
+    environment:
+      - TARGET_PORT=3000
+      - IFACE=eth0
+      - DATA_DIR=/data
+      - LOG_LEVEL=INFO
     volumes:
       - /sys/kernel/debug:/sys/kernel/debug
       - /sys/fs/bpf:/sys/fs/bpf
       - ./shared_data:/data
+    healthcheck:                # explorer startuje dopiero, gdy hooki TC są podpięte
+      test: ["CMD", "test", "-f", "/data/sniffer_ready.flag"]
+      interval: 2s
+      timeout: 2s
+      retries: 90
     depends_on:
       - target_app
 
   explorer:
-    build: ./explorer
+    build:
+      context: .
+      dockerfile: explorer/Dockerfile
     container_name: explorer
     environment:
       - TARGET_URL=http://target_app:3000
-      - MAX_PAGES=10
+      - MAX_PAGES=25
+      - MAX_SECONDS=600
+      - SAFE_MODE=1
+      - NEGATIVE_PROBES=1
+      - CRUD_PROBE=1
+      - AUTO_REGISTER=1
+      # --- uwierzytelnianie (opcjonalne) ---
+      # - AUTH_USER=admin@juice-sh.op
+      # - AUTH_PASS=admin123
+      # - AUTH_TOKEN=eyJ...           (statyczny JWT)
+      # - AUTH_LOGIN_API=/rest/user/login
+      # - AUTH_LOGIN_BODY={"email":"{user}","password":"{pass}"}
+      # - PROFILES=[{"name":"anonymous"},{"name":"user","username":"a@b.c","password":"x"}]
     volumes:
       - ./shared_data:/data
     networks:
       - synth_net
     depends_on:
-      - target_app
-      - ebpf_sniffer
+      target_app:
+        condition: service_started
+      ebpf_sniffer:
+        condition: service_healthy
 
   synthesizer:
-    build: ./synthesizer
+    build:
+      context: .
+      dockerfile: synthesizer/Dockerfile
     container_name: synthesizer
     environment:
       - OLLAMA_URL=http://host.docker.internal:11434
       - MODEL_NAME=qwen2.5-coder:14b
+      - OLLAMA_NUM_CTX=16384        # num_ctx obejmuje prompt + odpowiedź!
+      - OLLAMA_NUM_PREDICT=6144
+      - OLLAMA_IDLE_TIMEOUT=300
+      - INNER_CEGIS_ITERS=4
+      - DATA_DIR=/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux; na Docker Desktop jest to nieszkodliwe
     volumes:
       - ./shared_data:/data
     networks:

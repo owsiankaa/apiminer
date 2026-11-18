@@ -1,212 +1,211 @@
+"""Agent syntetyzujący: IR (deterministyczny) -> schema (LLM + walidacja) -> main.py (LLM) -> wewnętrzny CEGIS (TestClient)."""
+from __future__ import annotations
+
 import ast
 import json
 import os
-import re
-import subprocess
-import tempfile
+import shutil
+import sqlite3
+import sys
 import time
-import requests
+from typing import Any, Dict, List, Optional
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:14b")
-TRAFFIC_FILE = "/data/traffic.jsonl"
-DONE_FLAG = "/data/explorer_done.flag"
-OUT_DIR = "/data/generated_twin"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import codecheck, diffing, repair  # noqa: E402
+from common.ir import ApiModel  # noqa: E402
+from common.llm import LLMError, OllamaClient, extract_tag  # noqa: E402
+from common.logs import get_logger  # noqa: E402
+from common.traffic import load_exchanges  # noqa: E402
+
+log = get_logger("synthesizer")
+DATA = os.getenv("DATA_DIR", "/data")
+OUT = os.path.join(DATA, "generated_twin")
+MAX_INNER = int(os.getenv("INNER_CEGIS_ITERS", "4"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+DOCKERFILE = """FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+HEALTHCHECK --interval=5s --timeout=3s --retries=12 CMD python -c "import socket;socket.create_connection(('127.0.0.1',8000),2).close()" || exit 1
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header", "--no-access-log"]
+"""
+REQUIREMENTS = "fastapi>=0.110\nuvicorn>=0.29\nsqlalchemy>=2.0\npydantic>=2.5\nemail-validator\npython-multipart\n"
 
 
-def wait_for_explorer():
-    print("[Synthesizer] Oczekuję na zakończenie autonomicznej eksploracji (explorer)...")
-    while not os.path.exists(DONE_FLAG):
+def wait_for_pipeline() -> None:
+    flags = [os.path.join(DATA, "explorer_done.flag"), os.path.join(DATA, "collector_done.flag")]
+    log.info("Czekam na explorer + kolektor eBPF…")
+    t0 = time.time()
+    while not all(os.path.exists(f) for f in flags):
+        if time.time() - t0 > float(os.getenv("PIPELINE_TIMEOUT_S", "1800")):
+            raise TimeoutError("Timeout oczekiwania na explorer/collector")
         time.sleep(1.0)
-    time.sleep(2.0)
-
-    if not os.path.exists(TRAFFIC_FILE):
-        raise FileNotFoundError("Brak pliku traffic.jsonl - eBPF nie zapisał ruchu.")
-    with open(TRAFFIC_FILE, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+    with open(flags[0], encoding="utf-8") as f:
+        if "failed" in f.read():
+            log.warning("Explorer zgłosił błąd – kontynuuję na tym, co zebrano.")
 
 
-def ask_ollama(prompt: str) -> str:
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": MODEL_NAME,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": 8192},
-        },
-        timeout=600,
-    )
-    resp.raise_for_status()
-    return resp.json()["response"]
-
-
-def extract_tag(text: str, tag: str) -> str:
-    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
-    content = match.group(1).strip() if match else text.strip()
-    content = re.sub(r"^```[a-zA-Z0-9]*\n?", "", content)
-    content = re.sub(r"\n?```$", "", content)
-    return content.strip()
-
-
-def compact_json_value(val, depth=0):
-    if depth > 4:
-        return "..."
-    if isinstance(val, list):
-        return [compact_json_value(x, depth + 1) for x in val[:2]]
-    if isinstance(val, dict):
-        return {k: compact_json_value(v, depth + 1) for k, v in list(val.items())[:25]}
-    if isinstance(val, str) and len(val) > 100:
-        return val[:100] + "..."
-    return val
-
-
-def compact_http_frame(raw_http: str) -> str:
-    if "\r\n\r\n" not in raw_http:
-        return raw_http[:600]
-    headers, body = raw_http.split("\r\n\r\n", 1)
-    first_line = headers.splitlines()[0] if headers.splitlines() else ""
-    body_clean = body.strip()
-    if body_clean:
-        try:
-            parsed = json.loads(body_clean)
-            body_clean = json.dumps(compact_json_value(parsed), ensure_ascii=False)
-        except Exception:
-            body_clean = body_clean[:400]
-    return f"{first_line}\n{body_clean}"
-
-
-def deduplicate_traces(records: list[dict]) -> str:
-    seen_signatures = set()
-    selected = []
-    last_req_sig = None
-
-    for r in records:
-        if r["direction"] == "request":
-            sig = f"{r.get('method')} {r.get('endpoint_template')}"
-            last_req_sig = sig
-            if sig not in seen_signatures:
-                seen_signatures.add(sig)
-                selected.append(f"[REQUEST | {sig}]\n{compact_http_frame(r['raw_http'])}")
-        elif r["direction"] == "response" and last_req_sig:
-            status_line = r["raw_http"].splitlines()[0] if r["raw_http"].splitlines() else ""
-            res_sig = f"{last_req_sig} -> {status_line}"
-            if res_sig not in seen_signatures:
-                seen_signatures.add(res_sig)
-                selected.append(f"[RESPONSE | {res_sig}]\n{compact_http_frame(r['raw_http'])}")
-
-    return "\n---\n".join(selected[:30])
-
-
-def validate_code_runtime(code: str) -> str | None:
-    if not code:
-        return "Pusty kod Pythona"
+def validate_sql(ddl: str) -> Optional[str]:
     try:
-        ast.parse(code)
-    except SyntaxError as e:
-        return f"SyntaxError w linii {e.lineno}: {e.msg}"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        test_file = os.path.join(tmpdir, "test_twin.py")
-        with open(test_file, "w", encoding="utf-8") as f:
-            f.write(code)
-        res = subprocess.run(
-            ["python3", "-c", "import sys; sys.path.insert(0, '.'); import test_twin"],
-            cwd=tmpdir,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if res.returncode != 0:
-            err_lines = res.stderr.strip().splitlines()
-            return "\n".join(err_lines[-6:])
-    return None
+        con = sqlite3.connect(":memory:")
+        con.executescript(ddl)
+        con.close()
+        return None
+    except sqlite3.Error as e:
+        return str(e)
 
 
-def main():
-    records = wait_for_explorer()
-    condensed_log = deduplicate_traces(records)
-    print(f"[Synthesizer] Przetworzono {len(records)} komunikatów eBPF -> skompresowano unikalne kontrakty API.")
-
-    print(f"[Synthesizer] Etap 1/2: Inferencja OpenAPI 3.1 i schematu bazy danych ({MODEL_NAME})...")
-    stage1_prompt = f"""Jesteś architektem oprogramowania. Na podstawie skompresowanego ruchu HTTP przechwyconego metodą czarnej skrzynki wygeneruj:
-1. Zwięzłą specyfikację OpenAPI 3.1 (JSON) dla wszystkich wykrytych ścieżek i metod HTTP (zachowaj dokładne ścieżki `/api/...` i `/rest/...`, trailing slashes oraz kody odpowiedzi np. 200, 201, 401).
-2. Schemat bazy danych SQLite (DDL CREATE TABLE) dla wszystkich zasobów, uwzględniając kolumny używane w parametrach zapytań (np. `name`, `q`, `category`).
-
-PRZECHWYCONY RUCH HTTP:
-{condensed_log}
-
-Zwróć odpowiedź DOKŁADNIE w tych dwóch tagach XML:
-<openapi>
-JSON OpenAPI 3.1
-</openapi>
-<sql>
-kod SQL CREATE TABLE ...
-</sql>"""
-
-    stage1_raw = ask_ollama(stage1_prompt)
-    openapi_spec = extract_tag(stage1_raw, "openapi")
-    sql_code = extract_tag(stage1_raw, "sql")
-
-    print(f"[Synthesizer] Etap 2/2: Generowanie kodu backendu FastAPI + SQLAlchemy...")
-    stage2_prompt = f"""Na podstawie poniższej specyfikacji OpenAPI 3.1 i schematu SQL wygeneruj kompletny plik `main.py` w Pythonie (FastAPI + SQLite + SQLAlchemy).
-
-KRYTYCZNE WYMAGANIA (BEZWZGLĘDNIE PRZESTRZEGAJ):
-1. Zaimplementuj WSZYSTKIE ścieżki i metody HTTP ze specyfikacji OpenAPI (zachowaj dokładne ukośniki końcowe np. `/api/Challenges/`).
-2. Endpointy listujące kolekcje (`GET` bez ID na końcu) NIGDY nie mogą zwracać 404 gdy tabela jest pusta! Zawsze zwracaj status 200 z pustą listą (np. `[]` lub `{{"status": "success", "data": []}}` zgodnie ze specyfikacją).
-3. W funkcji `@app.on_event("startup")` zainicjalizuj po 2 przykładowe rekordy w KAŻDEJ tabeli zdefiniowanej w bazie (nie tylko w pierwszych dwóch!).
-4. Jeśli endpoint używa parametru `Query` (np. `name`, `q`, `fields`), upewnij się, że używasz `getattr(Model, field_name, None)` lub że taka kolumna istnieje w modelu SQLAlchemy, aby uniknąć `AttributeError` (HTTP 500).
-5. Jeśli w specyfikacji endpoint zwracał `401` (np. nieudane logowanie), zwróć `JSONResponse(status_code=401, content=...)` lub `Response(status_code=401, content=...)`.
-6. Oddziel modele SQLAlchemy (`Base`) od schematów Pydantic (`BaseModel`).
-
-SPECYFIKACJA OPENAPI 3.1:
-{openapi_spec}
-
-SCHEMAT SQL:
-{sql_code}
-
-Zwróć wyłącznie kompletny kod Pythona wewnątrz tagów <python>...</python>:
-<python>
-...
-</python>"""
-
-    stage2_raw = ask_ollama(stage2_prompt)
-    py_code = extract_tag(stage2_raw, "python")
-
-    for attempt in range(1, 4):
-        err = validate_code_runtime(py_code)
+def stage_schema(llm: OllamaClient, model: ApiModel, heuristic: str) -> str:
+    ddl = heuristic
+    if os.getenv("LLM_SCHEMA_REVIEW", "1") == "0" or len(heuristic) > 7000:
+        log.info("Pomijam LLM-review schematu (DDL %d znaków / LLM_SCHEMA_REVIEW=0) – używam IR.", len(heuristic))
+        return heuristic
+    budget_chars = int(llm.prompt_budget_tokens * 3.2 * 0.85)
+    prompt = repair.schema_prompt(model.digest(max(1500, min(9000, budget_chars - len(heuristic) - 1500))), heuristic)
+    for attempt in range(1, 3):
+        try:
+            cand = llm.generate_tagged(prompt, "sql", system=repair.SYSTEM, label=f"schema#{attempt}")
+        except LLMError as e:
+            log.error("LLM (schema) niedostępny: %s – używam schematu heurystycznego", e)
+            return heuristic
+        err = validate_sql(cand)
         if not err:
-            print(f"[Synthesizer] Walidacja AST i Runtime zakończona sukcesem (próba {attempt}).")
+            tables_h = {r.name for r in model.resources.values()}
+            lost = [t for t in tables_h if f'"{t}"' not in cand and t not in cand]
+            if lost:
+                log.warning("LLM pominął tabele %s – dołączam z heurystyki", lost)
+                cand = cand.rstrip() + "\n\n" + heuristic
+                if validate_sql(cand):
+                    return heuristic
+            return cand
+        log.warning("Schemat LLM niepoprawny (%s) – naprawa", err)
+        prompt += f"\n\nYour previous DDL failed in SQLite: {err}\nReturn corrected DDL in <sql></sql>."
+    log.warning("Fallback do schematu heurystycznego")
+    return ddl
+
+
+def write_artifacts(out: str, code: str, ddl: str, model: ApiModel) -> None:
+    os.makedirs(out, exist_ok=True)
+    shutil.copy(os.path.join(HERE, "common", "twin_runtime.py"), os.path.join(out, "twin_runtime.py"))
+    files = {
+        "main.py": code, "schema.sql": ddl, "Dockerfile": DOCKERFILE, "requirements.txt": REQUIREMENTS,
+        "openapi.json": json.dumps(model.openapi(), indent=2, ensure_ascii=False),
+        "seed.json": json.dumps(model.seed(), ensure_ascii=False),
+        "headers.json": json.dumps(model.headers_cfg, ensure_ascii=False, indent=2),
+        "ir_digest.txt": model.digest(30000),
+        ".dockerignore": "__pycache__\n*.pyc\n",
+    }
+    for name, text in files.items():
+        with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+
+
+def evaluate(out: str, code: str, openapi: Dict[str, Any], cases: List[Dict[str, Any]], known_tables: List[str]) -> Dict[str, Any]:
+    """Jedna iteracja walidacji: lint -> import/trasy -> replay obserwowanych żądań przez TestClient."""
+    result: Dict[str, Any] = {"static": codecheck.lint(code), "import_error": "", "missing_routes": [], "cases": [], "score": None, "analysis": None}
+    if any(s.startswith("SyntaxError") for s in result["static"]):
+        return result
+    info = codecheck.inspect_twin(out)
+    if not info["ok"]:
+        result["import_error"] = info["error"]
+        return result
+    result["missing_routes"] = codecheck.missing_routes(openapi, info["routes"])
+    try:
+        actual = codecheck.replay(out, cases)
+    except RuntimeError as e:
+        result["import_error"] = f"Replay failed: {e}"
+        return result
+    for c, a in zip(cases, actual):
+        twin = diffing.make_resp(a["status"], a["headers"], a["text"], a["data"], a.get("traceback", ""))
+        issues = diffing.compare(c["expected"], twin)
+        c = dict(c)
+        c.update(actual=twin, issues=[i.as_dict() for i in issues], twin_traceback=a.get("traceback", ""))
+        result["cases"].append(c)
+    result["score"] = diffing.score(result["cases"])
+    result["analysis"] = diffing.analyze_cases(result["cases"], known_tables=known_tables)
+    return result
+
+
+def main() -> None:
+    t_start = time.time()
+    wait_for_pipeline()
+    exchanges = load_exchanges(os.path.join(DATA, "exchanges.jsonl"))
+    if not exchanges:
+        raise RuntimeError("Brak wymian API w exchanges.jsonl – sprawdź logi ebpf_sniffer/explorer (TLS? zły port?).")
+    hints: List[str] = []
+    hp = os.path.join(DATA, "static_api_hints.json")
+    if os.path.exists(hp):
+        with open(hp, encoding="utf-8") as f:
+            hints = json.load(f)
+    model = ApiModel(exchanges, hints)
+    log.info("IR: %s", json.dumps(model.summary(), ensure_ascii=False))
+    heuristic = model.ddl()
+    openapi = model.openapi()
+    tables = [r.name for r in model.resources.values()]
+    route_list = "\n".join(f"{m.upper()} {p}" for p, ops in openapi["paths"].items() for m in ops)
+
+    llm = OllamaClient()
+    llm.ensure_ready()
+    log.info("Etap 1/3: schemat bazy (IR + LLM + walidacja SQLite)…")
+    ddl = stage_schema(llm, model, heuristic)
+
+    log.info("Etap 2/3: generacja main.py…")
+    code = llm.generate_tagged(repair.codegen_prompt(model.digest(max(2000, min(14000, int(llm.prompt_budget_tokens * 3.2 * 0.85) - len(ddl) - len(route_list) - len(repair.CONTRACT) - 500))), ddl, route_list), "python", system=repair.SYSTEM, label="codegen")
+
+    log.info("Etap 3/3: wewnętrzny CEGIS (TestClient, %d iteracji max)…", MAX_INNER)
+    cases = diffing.cases_from_exchanges(exchanges, 150) + diffing.derive_probe_cases(exchanges, 40)
+    # probes nie mają 'expected' – bierzemy tylko obserwowane do wewnętrznej oceny
+    cases = [c for c in cases if "expected" in c]
+    history: List[Dict[str, Any]] = []
+    best = {"pct": -1.0, "code": code}
+    stagnation = 0
+    for it in range(1, MAX_INNER + 2):
+        code, notes = codecheck.autofix(code)
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            notes.append(f"SyntaxError line {e.lineno}")
+        write_artifacts(OUT, code, ddl, model)
+        ev = evaluate(OUT, code, openapi, cases, tables)
+        pct = ev["score"]["lenient_pct"] if ev["score"] else 0.0
+        history.append({"iter": it, "autofix": notes, "lint": ev["static"], "import_error": ev["import_error"][:300],
+                        "missing_routes": len(ev["missing_routes"]), "score": ev["score"]})
+        log.info("iter %d: lenient=%.1f%% brakujących tras=%d lint=%d %s", it, pct, len(ev["missing_routes"]), len(ev["static"]), "IMPORT ERR" if ev["import_error"] else "")
+        if pct > best["pct"]:
+            best, stagnation = {"pct": pct, "code": code}, 0
+        else:
+            stagnation += 1
+        if (pct >= 100.0 and not ev["missing_routes"]) or it > MAX_INNER or stagnation >= 2:
             break
-        print(f"[Synthesizer] Wykryto błąd podczas weryfikacji:\n{err}\n-> Wysyłam do samonaprawy...")
-        fix_prompt = f"""Popraw poniższy kod Python FastAPI, ponieważ zgłasza błąd:
-{err}
-
-Zwróć wyłącznie poprawiony kod wewnątrz tagów <python>...</python>.
-<python>
-{py_code}
-</python>"""
-        fixed_raw = ask_ollama(fix_prompt)
-        py_code = extract_tag(fixed_raw, "python")
-
-    os.makedirs(OUT_DIR, exist_ok=True)
-    with open(f"{OUT_DIR}/openapi.json", "w", encoding="utf-8") as f:
-        f.write(openapi_spec + "\n")
-    with open(f"{OUT_DIR}/schema.sql", "w", encoding="utf-8") as f:
-        f.write(sql_code + "\n")
-    with open(f"{OUT_DIR}/main.py", "w", encoding="utf-8") as f:
-        f.write(py_code + "\n")
-    with open(f"{OUT_DIR}/Dockerfile", "w", encoding="utf-8") as f:
-        f.write(
-            "FROM python:3.11-slim\n"
-            "WORKDIR /app\n"
-            "RUN pip install --no-cache-dir fastapi uvicorn sqlalchemy pydantic\n"
-            "COPY main.py .\n"
-            'CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]\n'
-        )
-
-    print(f"[Synthesizer] SUKCES! Wygenerowano artefakty w {OUT_DIR}")
+        extra = "\n".join(ev["static"] + [f"IMPORT/RUNTIME ERROR:\n{ev['import_error']}"] * bool(ev["import_error"])
+                          + [f"Missing route: {r}" for r in ev["missing_routes"][:20]])
+        analysis_text = diffing.render_analysis(ev["analysis"]) if ev["analysis"] else "(no replay – fix static/import errors first)"
+        regress = "" if pct >= best["pct"] else "The previous attempt scored WORSE than the best version; you were given the best version – avoid the same mistake."
+        prompt = repair.repair_prompt(best["code"], ddl, analysis_text, "", model.digest(5000), llm.prompt_budget_tokens, extra, regress)
+        try:
+            code = llm.generate_tagged(prompt, "python", system=repair.SYSTEM, label=f"repair#{it}")
+        except LLMError as e:
+            log.error("LLM padł w naprawie: %s", e)
+            break
+    code = best["code"]
+    code, _ = codecheck.autofix(code)
+    write_artifacts(OUT, code, ddl, model)
+    report = {"model": llm.model, "seconds": round(time.time() - t_start, 1), "ir": model.summary(), "history": history,
+              "best_lenient_pct": best["pct"], "num_ctx": llm.num_ctx, "num_predict": llm.num_predict}
+    with open(os.path.join(DATA, "synthesis_report.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    log.info("SUKCES. Artefakty: %s | najlepszy wynik offline: %.1f%%", OUT, best["pct"])
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        open(os.path.join(DATA, "synthesizer_done.flag"), "w").write("ok\n")
+    except Exception:
+        log.exception("Synthesizer zakończył się błędem")
+        open(os.path.join(DATA, "synthesizer_failed.flag"), "w").write("failed\n")
+        sys.exit(1)

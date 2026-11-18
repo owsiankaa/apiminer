@@ -1,169 +1,123 @@
+"""Kolektor: czyta zdarzenia z loadera eBPF, składa TCP -> HTTP i zapisuje pełne wymiany do /data/exchanges.jsonl."""
+from __future__ import annotations
+
 import json
 import os
-import re
+import queue
+import signal
+import socket
+import struct
 import subprocess
+import sys
+import threading
 import time
-from collections import defaultdict
 
-WRAPPER_C = """
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <signal.h>
-#include <net/if.h>
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common.httpwire import FlowTable  # noqa: E402
+from common.logs import get_logger  # noqa: E402
+from common.traffic import exchange_to_record  # noqa: E402
 
-static volatile bool exiting = false;
-static void sig_handler(int sig) { exiting = true; }
-
-struct event {
-    __u32 saddr;
-    __u32 daddr;
-    __u16 sport;
-    __u16 dport;
-    __u8  direction;
-    __u32 payload_len;
-    char  payload[1500];
-};
-
-static int handle_event(void *ctx, void *data, size_t data_sz) {
-    const struct event *e = data;
-    printf("EVT|%u|%u|%u|%u|%u|%u|", e->direction, e->saddr, e->daddr, e->sport, e->dport, e->payload_len);
-    for (size_t i = 0; i < e->payload_len; i++) {
-        printf("%02x", (unsigned char)e->payload[i]);
-    }
-    printf("\\n");
-    fflush(stdout);
-    return 0;
-}
-
-int main() {
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-
-    struct bpf_object *obj = bpf_object__open_file("http_sniffer.bpf.o", NULL);
-    if (!obj) { fprintf(stderr, "open failed\\n"); return 1; }
-    if (bpf_object__load(obj)) { fprintf(stderr, "load failed\\n"); return 1; }
-
-    int prog_in_fd = bpf_program__fd(bpf_object__find_program_by_name(obj, "tc_ingress"));
-    int prog_eg_fd = bpf_program__fd(bpf_object__find_program_by_name(obj, "tc_egress"));
-    int map_fd = bpf_object__find_map_fd_by_name(obj, "rb");
-
-    int ifindex = if_nametoindex("eth0");
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS);
-    bpf_tc_hook_create(&hook);
-
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts_in, .prog_fd = prog_in_fd);
-    hook.attach_point = BPF_TC_INGRESS;
-    bpf_tc_attach(&hook, &opts_in);
-
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts_eg, .prog_fd = prog_eg_fd);
-    hook.attach_point = BPF_TC_EGRESS;
-    bpf_tc_attach(&hook, &opts_eg);
-
-    struct ring_buffer *rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
-    fprintf(stderr, "[eBPF] TC hooks aktywne na eth0! Nasłuchuję ruchu TCP na porcie 3000...\\n");
-
-    while (!exiting) {
-        ring_buffer__poll(rb, 100);
-    }
-
-    ring_buffer__free(rb);
-    bpf_object__close(obj);
-    return 0;
-}
-"""
-
-HTTP_START_RE = re.compile(r"^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+(\S+)\s+HTTP/1\.[01]|^HTTP/1\.[01]\s+(\d{3})")
+log = get_logger("collector")
+DATA = os.getenv("DATA_DIR", "/data")
+PORT = int(os.getenv("TARGET_PORT", "3000"))
+OUT = os.path.join(DATA, "exchanges.jsonl")
+STATS = os.path.join(DATA, "collector_stats.json")
+EXPLORER_DONE = os.path.join(DATA, "explorer_done.flag")
+COLLECTOR_DONE = os.path.join(DATA, "collector_done.flag")
+GRACE = float(os.getenv("COLLECTOR_GRACE_S", "4"))
 
 
-def normalize_endpoint(path: str) -> str:
-    clean_path = path.split("?")[0]
-    return re.sub(r"/\d+(?=/|$)", "/{id}", clean_path)
+def ip_str(raw: int) -> str:
+    return socket.inet_ntoa(struct.pack("=I", raw))
 
 
-def is_api_traffic(raw_http: str) -> bool:
-    lower = raw_http.lower()
-    if any(ext in lower for ext in ["text/html", "text/css", "javascript", "image/", "font/"]):
-        return False
-    first_line = raw_http.splitlines()[0] if raw_http.splitlines() else ""
-    if any(first_line.startswith(f"GET {p}") for p in ["/ ", "/assets/", "/main", "/polyfills", "/runtime", "/vendor", "/styles", "/favicon", "/socket.io"]):
-        return False
-    return "application/json" in lower or "/api/" in first_line or "/rest/" in first_line
+def reader(proc: subprocess.Popen, q: "queue.Queue[bytes | None]") -> None:
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        q.put(line)
+    q.put(None)
 
 
-def main():
-    with open("loader.c", "w") as f:
-        f.write(WRAPPER_C)
-    subprocess.run(["gcc", "-O2", "loader.c", "-lbpf", "-o", "loader"], check=True)
+def main() -> None:
+    os.makedirs(DATA, exist_ok=True)
+    for p in (OUT, STATS, COLLECTOR_DONE):
+        if os.path.exists(p):
+            os.remove(p)
 
-    out_path = "/data/traffic.jsonl"
-    os.makedirs("/data", exist_ok=True)
-    if os.path.exists(out_path):
-        os.remove(out_path)
+    proc = subprocess.Popen(["./loader"], stdout=subprocess.PIPE, bufsize=1 << 20)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=200_000)
+    threading.Thread(target=reader, args=(proc, q), daemon=True).start()
 
-    proc = subprocess.Popen(["./loader"], stdout=subprocess.PIPE, text=True)
-    stream_buffers = defaultdict(str)
+    table = FlowTable(PORT, idle_timeout=float(os.getenv("FLOW_IDLE_S", "30")))
+    kernel = {"events": 0, "dropped": 0, "truncated": 0}
+    ex_id = 0
+    static_n = api_n = 0
+    last_event = time.time()
+    done_written = False
+    tls_warned = False
 
-    def flush_buffer(flow_key, log_file):
-        buf = stream_buffers.get(flow_key, "")
-        if not buf:
-            return
-        stream_buffers[flow_key] = ""
-
-        if not HTTP_START_RE.match(buf):
-            return
-        if not is_api_traffic(buf):
-            return
-
-        direction, _, _, sport, dport = flow_key
-        first_line = buf.splitlines()[0]
-        parts = first_line.split()
-        method = parts[0] if direction == "request" and len(parts) >= 2 else None
-        raw_path = parts[1] if direction == "request" and len(parts) >= 2 else None
-        endpoint_tpl = normalize_endpoint(raw_path) if raw_path else None
-
-        record = {
-            "timestamp": time.time(),
-            "direction": direction,
-            "sport": int(sport),
-            "dport": int(dport),
-            "method": method,
-            "path": raw_path,
-            "endpoint_template": endpoint_tpl,
-            "raw_http": buf[:4096],
-        }
-        log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        log_file.flush()
-        print(f"[eBPF Stream] {direction.upper()}: {first_line}")
-
-    with open(out_path, "a", encoding="utf-8") as log_file:
-        for line in proc.stdout:
-            if not line.startswith("EVT|"):
+    def emit(fh, exchanges) -> None:
+        nonlocal ex_id, static_n, api_n
+        for ex in exchanges:
+            if ex.req is None:
                 continue
-            parts = line.strip().split("|")
-            if len(parts) != 8:
-                continue
-            _, dir_code, saddr, daddr, sport, dport, _, hex_data = parts
-            direction = "request" if dir_code == "0" else "response"
-            flow_key = (direction, saddr, daddr, sport, dport)
+            ex_id += 1
+            rec = exchange_to_record(ex_id, ex.conn, ex.req, ex.resp, ex.latency_us)
+            if rec["kind"] == "api":
+                api_n += 1
+            elif rec["kind"] == "static":
+                static_n += 1
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if rec["kind"] == "api":
+                st = rec["response"]["status"] if rec["response"] else "-"
+                log.info("%s %s -> %s", rec["request"]["method"], rec["request"]["path"], st)
+        fh.flush()
 
-            chunk = bytes.fromhex(hex_data).decode("utf-8", errors="replace")
+    def write_stats() -> None:
+        with open(STATS, "w", encoding="utf-8") as f:
+            json.dump({"kernel": kernel, "flows": table.stats, "exchanges_api": api_n, "exchanges_static": static_n, "ts": time.time()}, f)
 
-            if HTTP_START_RE.match(chunk) and stream_buffers[flow_key]:
-                flush_buffer(flow_key, log_file)
-
-            stream_buffers[flow_key] += chunk
-
-            if "\r\n\r\n" in stream_buffers[flow_key]:
-                headers, body = stream_buffers[flow_key].split("\r\n\r\n", 1)
-                cl_match = re.search(r"content-length:\s*(\d+)", headers, re.I)
-                if cl_match:
-                    expected_len = int(cl_match.group(1))
-                    if len(body.encode("utf-8")) >= expected_len:
-                        flush_buffer(flow_key, log_file)
-                else:
-                    flush_buffer(flow_key, log_file)
+    with open(OUT, "a", encoding="utf-8") as fh:
+        while not stop.is_set():
+            try:
+                line = q.get(timeout=0.5)
+            except queue.Empty:
+                line = b"__TICK__"
+            now = time.time()
+            if line is None:
+                log.error("loader zakończył działanie (kod %s)", proc.poll())
+                break
+            if line.startswith(b"EVT|"):
+                parts = line.rstrip().split(b"|")
+                if len(parts) != 12:
+                    continue
+                _, _dir, sa, da, sp, dp, fl, seq, _ack, ts, ln, hexd = parts
+                data = bytes.fromhex(hexd.decode()) if hexd else b""
+                last_event = now
+                emit(fh, table.feed_event(ip_str(int(sa)), ip_str(int(da)), int(sp), int(dp), int(seq), int(fl), data, now, int(ts)))
+            elif line.startswith(b"STAT|"):
+                _, e, d, t = line.rstrip().split(b"|")
+                kernel.update(events=int(e), dropped=int(d), truncated=int(t))
+                if int(d):
+                    log.warning("Kernel ring buffer: %s zdarzeń odrzuconych – zwiększ rozmiar rb lub zmniejsz tempo", d.decode())
+                write_stats()
+            emit(fh, table.gc(now))
+            if table.stats["tls_conns"] and not tls_warned:
+                tls_warned = True
+                log.warning("Wykryto ruch TLS (%d połączeń) – eBPF TC widzi tylko szyfrogram. Użyj HTTP lub terminacji TLS przed targetem.", table.stats["tls_conns"])
+            if os.path.exists(EXPLORER_DONE) and not done_written and now - last_event > GRACE:
+                emit(fh, table.gc(now, force=True))
+                write_stats()
+                with open(COLLECTOR_DONE, "w", encoding="utf-8") as f:
+                    f.write("done\n")
+                done_written = True
+                log.info("Explorer zakończył, ruch zdrenowany: %d wymian API, %d statycznych.", api_n, static_n)
+        emit(fh, table.gc(time.time(), force=True))
+        write_stats()
+    proc.terminate()
 
 
 if __name__ == "__main__":
